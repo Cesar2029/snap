@@ -1,0 +1,1113 @@
+---
+title: "final_project"
+format: html
+---
+
+```{r}
+getwd()
+```
+
+
+```{r}
+activation <- dbGetQuery(con, sprintf("
+  WITH raw AS (
+    SELECT \"payment.actor.username\"             AS actor,
+           substr(\"payment.actor.date_joined\", 1, 10)::DATE      AS actor_joined,
+           \"payment.target.user.username\"       AS targ,
+           substr(\"payment.target.user.date_joined\", 1, 10)::DATE AS targ_joined,
+           substr(\"payment.date_created\", 1, 10)::DATE            AS d
+    FROM read_csv_auto('%s', sample_size=-1, all_varchar=true)
+    WHERE \"payment.target.type\" = 'user'
+  ),
+  act AS (
+    SELECT actor AS usr, actor_joined AS joined, d FROM raw
+    WHERE actor IS NOT NULL AND actor <> ''
+    UNION ALL
+    SELECT targ, targ_joined, d FROM raw
+    WHERE targ IS NOT NULL AND targ <> ''
+  )
+  SELECT usr,
+         MIN(joined)    AS joined,
+         MIN(d)         AS first_txn,
+         MIN(d) - MIN(joined) AS days_to_first
+  FROM act
+  WHERE joined IS NOT NULL AND d IS NOT NULL
+  GROUP BY usr
+", csv))
+
+saveRDS(activation, "activation.rds")
+```
+
+# Define our target user cohort:
+# 1. 'joined >= start': Ignores old users who joined before we started tracking transactions.
+# 2. 'joined <= end - 30': Ignores brand-new users so everyone gets a fair 30 days to make their first transaction. 
+# 3. Keeps our success rates accurate and fair for every user in the group.
+# Filter the data to only include users from this clean date range.
+
+```{r}
+library(dplyr)
+
+start <- min(activation$first_txn, na.rm = TRUE)
+end   <- max(activation$first_txn, na.rm = TRUE)
+
+cohort <- activation |>
+  filter(joined >= start, joined <= end - 30)
+
+nrow(cohort)
+
+slow_starters <- cohort |>
+  filter(days_to_first >= 30) |>
+  select(usr, joined, first_txn, days_to_first) |>
+  arrange(desc(days_to_first))
+
+nrow(slow_starters)
+head(slow_starters)
+saveRDS(slow_starters, "slow_starters.rds")
+```
+
+
+```{r}
+# Query user-to-user transaction counts involving at least one slow starter
+user_to_user <- dbGetQuery(con, sprintf("
+  WITH raw AS (
+    SELECT \"payment.actor.username\"       AS userA,
+           \"payment.target.user.username\" AS userB
+    FROM read_csv_auto('%s', sample_size=-1, all_varchar=true)
+    WHERE \"payment.target.type\" = 'user'
+      AND \"payment.actor.username\" IS NOT NULL AND \"payment.actor.username\" <> ''
+      AND \"payment.target.user.username\" IS NOT NULL AND \"payment.target.user.username\" <> ''
+  )
+  SELECT userA, 
+         userB, 
+         COUNT(*) AS transaction_number
+  FROM raw
+  GROUP BY userA, userB
+", csv)) |>
+  # Keep rows where either userA OR userB is in our slow_starters list
+  filter(userA %in% slow_starters$usr | userB %in% slow_starters$usr)
+
+# Save to RDS file
+saveRDS(user_to_user, "user_to_user.rds")
+
+# Quick preview
+head(user_to_user)
+nrow(user_to_user)
+```
+
+
+
+```{r}
+# Load the saved slow starters dataset
+slow_starters <- readRDS("slow_starters.rds")
+
+# Take a quick look at the data structure
+str(slow_starters)
+head(slow_starters)
+```
+```{r}
+# Load the saved slow starters dataset
+user_to_user <- readRDS("user_to_user.rds")
+
+# Take a quick look at the data structure
+str(user_to_user)
+head(user_to_user)
+```
+
+
+
+```{r}
+library(dplyr)
+
+# Summary of time-to-first transaction and volume
+slow_starter_summary <- slow_starters |>
+  summarise(
+    total_slow_starters = n(),
+    avg_days_to_first   = mean(days_to_first, na.rm = TRUE),
+    median_days_to_first= median(days_to_first, na.rm = TRUE),
+    min_days_to_first   = min(days_to_first, na.rm = TRUE),
+    max_days_to_first   = max(days_to_first, na.rm = TRUE)
+  )
+
+print(slow_starter_summary)
+```
+
+```{r}
+# Load interaction network
+user_to_user <- readRDS("user_to_user.rds")
+
+# Measure network centrality / transaction degree for slow starters
+slow_starter_network_stats <- user_to_user |>
+  # Focus on transactions where userA is a slow starter
+  filter(userA %in% slow_starters$usr) |>
+  group_by(userA) |>
+  summarise(
+    unique_counterparties = n_distinct(userB),
+    total_transactions    = sum(transaction_number),
+    avg_txns_per_partner  = mean(transaction_number)
+  ) |>
+  arrange(desc(unique_counterparties))
+
+head(slow_starter_network_stats)
+```
+
+
+
+# Phase 1: Initial Onboarding & Baseline Position
+*These hypotheses establish the user's starting position and determine if their initial contact acts as a "gateway" into the platform.*
+
+1. **Priority 1: The Gateway Pendant Status**
+   * **Hypothesis 1:** User A takes a long time to start transacting if User A joins the app attached to only a single counterpart (as a pendant node) and uses it purely for 1-to-1 payments.
+   * **Network Property:** Pendants & Degree Centrality ($k$)
+   * **Rationale:** Establishes the baseline assumption: whether slow starters begin as isolated 1-to-1 utility users.
+   
+   
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+# 1. Load existing datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Calculate Degree Centrality (k) for each slow starter
+# k = number of unique counterparties a user transacts with
+degree_df <- user_to_user |>
+  filter(userA %in% slow_starters$usr) |>
+  group_by(userA) |>
+  summarise(
+    degree_k = n_distinct(userB),
+    total_txns = sum(transaction_number)
+  ) |>
+  rename(usr = userA)
+
+# 3. Merge degree back into slow_starters & classify pendant status
+h1_data <- slow_starters |>
+  left_join(degree_df, by = "usr") |>
+  mutate(
+    # Handle users with no recorded pairs if any (default to degree 0 or 1)
+    degree_k = ifelse(is.na(degree_k), 1, degree_k),
+    is_pendant = ifelse(degree_k == 1, "Pendant (k = 1)", "Networked (k > 1)")
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+# Summary Table: Proportion of Pendants & Days to First Transaction
+pendant_summary <- h1_data |>
+  group_by(is_pendant) |>
+  summarise(
+    user_count       = n(),
+    pct_of_cohort    = (n() / nrow(h1_data)) * 100,
+    avg_days_to_first = mean(days_to_first, na.rm = TRUE),
+    median_days      = median(days_to_first, na.rm = TRUE),
+    sd_days          = sd(days_to_first, na.rm = TRUE)
+  )
+
+print("=== Pendant Status Summary ===")
+print(pendant_summary)
+
+# 4. Statistical Hypothesis Test (Wilcoxon Rank-Sum Test / Mann-Whitney U)
+# Tests if days_to_first is significantly higher for Pendant nodes vs Networked nodes
+wilcox_test <- wilcox.test(days_to_first ~ is_pendant, data = h1_data)
+
+print("=== Hypothesis Test Result ===")
+print(wilcox_test)
+
+# 5. Correlation between Degree (k) and Days to First Transaction
+cor_test <- cor.test(h1_data$degree_k, h1_data$days_to_first, method = "spearman")
+print("=== Spearman Correlation (Degree k vs Days to First) ===")
+print(cor_test)
+```
+   
+   
+### Interpretation of Results
+
+The empirical analysis provides strong statistical support for **Hypothesis 1**:
+
+1. **Structural Baseline:** An overwhelming **93.7%** of slow starters are **Pendant nodes ($k = 1$)**. This confirms our baseline structural assumption: slow starters initially join Venmo primarily as a 1-to-1 payment tool attached to a single "gateway contact" rather than as active participants in a broader social feed.
+
+2. **Impact on Activation Time:** Pendant nodes experience significantly greater delays prior to their first transaction compared to networked nodes ($k > 1$). The median onboarding delay for pendants is **50 days** (mean = 57.0 days), compared to **45 days** (mean = 47.4 days) for networked users. 
+
+3. **Statistical Significance:** The Wilcoxon rank-sum test confirms that the difference in activation delays between pendants and non-pendants is highly significant ($W = 617,026,330, p < 0.001$). Additionally, Spearman's rank correlation ($\rho = -0.0791, p < 0.001$) confirms an inverse relationship between degree centrality and time-to-first transaction.
+
+**Conclusion:** Being structurally isolated as a pendant node acts as a major friction point during onboarding. Because these users lack diverse social exposure on the platform, their activation relies heavily on specific 1-on-1 utility needs rather than organic network engagement.
+
+
+
+
+
+2. **Priority 2: Gateway Hub Influence (The Friendship Paradox)**
+   * **Hypothesis 2:** User A transitions into active, social behavior if User A's initial counterpart is a high-degree hub user who exposes User A to a larger network.
+   * **Network Property:** The Friendship Paradox & Degree Assortativity
+   * **Rationale:** Identifies the single strongest structural driver of early activation—whether their "gateway friend" is a social connector.
+
+
+```{r hypothesis-2-gateway-hub-influence-fixed}
+library(dplyr)
+library(ggplot2)
+
+# 1. Load datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Calculate degrees for gateway partners (User B)
+user_B_degrees <- user_to_user |>
+  group_by(userB) |>
+  summarise(
+    partner_degree = n_distinct(userA),
+    partner_total_txns = sum(transaction_number)
+  ) |>
+  rename(gateway_partner = userB)
+
+# 3. Aggregate User A outcomes & link primary gateway partner
+user_A_outcomes <- user_to_user |>
+  filter(userA %in% slow_starters$usr) |>
+  group_by(userA) |>
+  summarise(
+    user_A_degree     = n_distinct(userB),
+    user_A_total_txns = sum(transaction_number),
+    is_expanded       = ifelse(n_distinct(userB) > 1, 1, 0),
+    primary_partner   = userB[which.max(transaction_number)][1]
+  ) |>
+  rename(usr = userA)
+
+# 4. Merge datasets
+h2_data <- slow_starters |>
+  inner_join(user_A_outcomes, by = "usr") |>
+  left_join(user_B_degrees, by = c("primary_partner" = "gateway_partner")) |>
+  mutate(
+    partner_degree = ifelse(is.na(partner_degree), 1, partner_degree),
+    # Categorize: Hub (> 1 connection) vs. Non-Hub (== 1 connection)
+    hub_category = ifelse(
+      partner_degree > 1,
+      "High-Degree Hub Partner (k_B > 1)",
+      "Low-Degree Partner (k_B = 1)"
+    )
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+# Summary Table
+hub_summary <- h2_data |>
+  group_by(hub_category) |>
+  summarise(
+    user_count            = n(),
+    avg_partner_degree    = mean(partner_degree, na.rm = TRUE),
+    expansion_rate_pct    = mean(is_expanded) * 100,
+    avg_user_A_degree     = mean(user_A_degree, na.rm = TRUE),
+    avg_user_A_total_txns = mean(user_A_total_txns, na.rm = TRUE),
+    median_user_A_txns    = median(user_A_total_txns, na.rm = TRUE)
+  )
+
+print("=== Gateway Hub Influence Summary ===")
+print(hub_summary)
+
+# 5. Wilcoxon Test (now guarantees 2 categories)
+wilcox_test_h2 <- wilcox.test(user_A_total_txns ~ hub_category, data = h2_data)
+print("=== Wilcoxon Test: User A Activity vs Partner Hub Status ===")
+print(wilcox_test_h2)
+
+# 6. Spearman Correlation (Continuous measure)
+cor_expansion <- cor.test(h2_data$partner_degree, h2_data$user_A_degree, method = "spearman")
+cor_activity  <- cor.test(h2_data$partner_degree, h2_data$user_A_total_txns, method = "spearman")
+
+print("=== Spearman Correlation: Partner Degree vs User A Unique Connections ===")
+print(cor_expansion)
+
+print("=== Spearman Correlation: Partner Degree vs User A Total Transactions ===")
+print(cor_activity)
+```
+### Interpretation of Results for Hypothesis 2
+
+The empirical results provide strong statistical validation for **Hypothesis 2**:
+
+1. **Impact on Network Expansion:** Slow starters whose initial gateway contact was a **High-Degree Hub ($k_B > 1$)** exhibited an expansion rate of **19.8%**, compared to only **9.89%** for those whose gateway partner had only a single connection ($k_B = 1$). Connecting to a well-connected user effectively **doubles the probability** that a slow starter will expand their transactions to additional counterparties.
+
+2. **Increased Transaction Volume:** Users attached to hub partners achieved higher overall network degree ($1.27$ vs $1.12$ unique counterparties) and completed more total transactions ($1.40$ vs $1.19$). 
+
+3. **Statistical Significance:** The Wilcoxon rank-sum test confirms that total transaction volume is significantly higher for users with hub partners ($W = 401,149,446, p < 0.001$). Furthermore, Spearman's rank correlation confirms positive, statistically significant relationships between the gateway partner's degree and both User A's unique connections ($\rho = 0.0944, p < 0.001$) and total transaction count ($\rho = 0.0925, p < 0.001$).
+
+**Conclusion:** Consistent with principles from *The Friendship Paradox*, high-degree hub contacts serve as vital network bridges. They expose isolated pendant users to wider social circles, pulling them out of quiet 1-to-1 utility usage and encouraging active multi-user participation on the platform.
+
+---
+
+# Phase 2: Immediate Dyadic Triggers & Lock-In
+*Focuses on immediate 1-on-1 interaction loops between User A and User B prior to higher-order network dynamics.*
+
+3. **Priority 3: Immediate Dyadic Reciprocity**
+   * **Hypothesis 9:** User A transitions into an active user if User B initiates a follow-up transaction directed at User A ($B \to A$) shortly after User A initiates an initial transaction with User B ($A \to B$).
+   * **Network Property:** Reciprocity / Participation Shift (PSAB-BA)
+   * **Rationale:** Direct feedback validation is the most immediate relational event encouraging a new user to return.
+
+```{r hypothesis-9-dyadic-reciprocity}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+
+# 1. Load slow_starters
+slow_starters <- readRDS("slow_starters.rds")
+
+# 2. Extract directional first & second transactions for slow starters
+# We pull User A's initial transaction (A -> B) and check if the NEXT transaction in that pair was B -> A
+pair_events <- dbGetQuery(con, sprintf("
+  WITH directed_txns AS (
+    SELECT 
+      \"payment.actor.username\"       AS actor,
+      \"payment.target.user.username\" AS target,
+      \"payment.date_created\"::TIMESTAMP AS txn_time
+    FROM read_csv_auto('%s', sample_size=-1, all_varchar=true)
+    WHERE \"payment.target.type\" = 'user'
+      AND \"payment.actor.username\" IS NOT NULL AND \"payment.actor.username\" <> ''
+  )
+  SELECT 
+    actor,
+    target,
+    txn_time,
+    LEAD(actor) OVER (PARTITION BY LEAST(actor, target), GREATEST(actor, target) ORDER BY txn_time ASC) AS next_actor,
+    LEAD(txn_time) OVER (PARTITION BY LEAST(actor, target), GREATEST(actor, target) ORDER BY txn_time ASC) AS next_txn_time,
+    ROW_NUMBER() OVER (PARTITION BY actor ORDER BY txn_time ASC) AS user_txn_seq
+  FROM directed_txns
+", csv)) |>
+  filter(actor %in% slow_starters$usr)
+
+# 3. Classify whether User A's first transaction was immediately reciprocated by User B (B -> A)
+h9_data <- pair_events |>
+  filter(user_txn_seq == 1) |>
+  mutate(
+    # Reciprocated if the very next actor in this pair was User B (next_actor == target)
+    is_reciprocated = ifelse(!is.na(next_actor) & next_actor == target, "Reciprocated (B -> A)", "Not Reciprocated"),
+    response_time_hours = as.numeric(difftime(next_txn_time, txn_time, units = "hours"))
+  )
+
+# 4. Link User A's total long-term activity to reciprocity status
+user_A_totals <- pair_events |>
+  group_by(actor) |>
+  summarise(
+    total_user_txns = n(),
+    total_unique_partners = n_distinct(target)
+  )
+
+h9_analysis <- h9_data |>
+  inner_join(user_A_totals, by = "actor") |>
+  mutate(
+    is_active_user = ifelse(total_user_txns > 1, 1, 0)
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+reciprocity_summary <- h9_analysis |>
+  group_by(is_reciprocated) |>
+  summarise(
+    user_count             = n(),
+    activation_rate_pct    = mean(is_active_user) * 100, # % who made >1 total transaction
+    avg_total_txns         = mean(total_user_txns),
+    median_total_txns      = median(total_user_txns),
+    avg_unique_partners    = mean(total_unique_partners)
+  )
+
+print("=== Immediate Dyadic Reciprocity Summary ===")
+print(reciprocity_summary)
+
+# 5. Statistical Hypothesis Test (Chi-Square Test for Activation Rate)
+chisq_test_h9 <- chisq.test(table(h9_analysis$is_reciprocated, h9_analysis$is_active_user))
+
+print("=== Chi-Square Test: Reciprocity vs. User Activation ===")
+print(chisq_test_h9)
+
+# 6. Wilcoxon Test for Total Transactions
+wilcox_test_h9 <- wilcox.test(total_user_txns ~ is_reciprocated, data = h9_analysis)
+
+print("=== Wilcoxon Test: Total Transactions vs. Reciprocity ===")
+print(wilcox_test_h9)
+
+```
+### Interpretation of Results for Hypothesis 9
+
+The continuous-time relational event analysis strongly supports **Hypothesis 9**:
+
+1. **Impact on User Activation:** Slow starters whose initial transaction ($A \to B$) was immediately reciprocated by their counterparty ($B \to A$) achieved an activation rate of **28.2%**, compared to **15.1%** for those whose initial transaction went unreciprocated. Immediate dyadic reciprocity increases the user activation probability by **1.87x** (+13.1 percentage points).
+
+2. **Scarcity of Early Reciprocity:** Only **2.66%** of slow starters experienced immediate dyadic reciprocity on their first payment event. The vast majority of initial transactions represent one-way utility transfers, highlighting a critical point of friction in early user onboarding.
+
+3. **Statistical Significance:** A Pearson's Chi-squared test confirms that the association between dyadic reciprocity and user activation is highly statistically significant ($\chi^2 = 318.1, p < 0.001$). Furthermore, the Wilcoxon rank-sum test ($W = 98,557,398, p < 0.001$) confirms a statistically significant shift toward higher total transaction volume for reciprocated users.
+
+**Conclusion:** Direct dyadic feedback acts as a critical social validation loop. When a peer responds to a slow starter's payment with a follow-up transaction, it confirms platform trust and transforms a single one-off payment into an active relational dialogue.
+
+
+
+4. **Priority 4: Habitual Pair Lock-In**
+   * **Hypothesis 7:** User A returns to quiet 1-to-1 usage if User A has high habitual inertia and only transacts with the same repeated contact over time.
+   * **Network Property:** Habitual Inertia & Relational Event Models (REM)
+   * **Rationale:** Explains why many slow starters remain utility-focused rather than expanding socially.
+
+
+```{r hypothesis-7-habitual-inertia}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+
+# 1. Load slow starters dataset
+slow_starters <- readRDS("slow_starters.rds")
+
+# 2. Extract transaction histories for active slow starters (total_txns >= 2)
+# We calculate the Proportion of Repeated Transactions to the Same Partner (Inertia Index)
+inertia_data <- dbGetQuery(con, sprintf("
+  WITH user_txns AS (
+    SELECT 
+      \"payment.actor.username\"       AS actor,
+      \"payment.target.user.username\" AS target,
+      \"payment.date_created\"::TIMESTAMP AS txn_time
+    FROM read_csv_auto('%s', sample_size=-1, all_varchar=true)
+    WHERE \"payment.target.type\" = 'user'
+      AND \"payment.actor.username\" IS NOT NULL AND \"payment.actor.username\" <> ''
+  )
+  SELECT 
+    actor,
+    COUNT(*) AS total_txns,
+    COUNT(DISTINCT target) AS unique_partners,
+    -- Mode partner (most frequent partner count)
+    MAX(partner_txn_count) AS top_partner_txns
+  FROM (
+    SELECT actor, target, COUNT(*) AS partner_txn_count
+    FROM user_txns
+    GROUP BY actor, target
+  )
+  GROUP BY actor
+", csv)) |>
+  filter(actor %in% slow_starters$usr, total_txns >= 2) |>
+  mutate(
+    # Habitual Inertia Ratio = fraction of all txns done with the top partner
+    inertia_ratio = top_partner_txns / total_txns,
+    # High Inertia = 100% of transactions with the exact same 1 partner
+    is_locked_in = ifelse(inertia_ratio == 1.0, "Exclusive Pair (100% Inertia)", "Expanded Pair (<100% Inertia)"),
+    is_expanded = ifelse(unique_partners > 1, 1, 0)
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+inertia_summary <- inertia_data |>
+  group_by(is_locked_in) |>
+  summarise(
+    user_count             = n(),
+    pct_of_active_cohort   = (n() / nrow(inertia_data)) * 100,
+    avg_total_txns         = mean(total_txns),
+    median_total_txns      = median(total_txns),
+    expansion_rate_pct     = mean(is_expanded) * 100,
+    avg_unique_partners    = mean(unique_partners)
+  )
+
+print("=== Habitual Pair Lock-In Summary ===")
+print(inertia_summary)
+
+# 3. Statistical Test: Correlation between Habitual Inertia and Network Expansion
+cor_inertia <- cor.test(inertia_data$inertia_ratio, inertia_data$unique_partners, method = "spearman")
+
+print("=== Spearman Correlation: Habitual Inertia Ratio vs Unique Partners ===")
+print(cor_inertia)
+
+# 4. Distribution of Habitual Inertia Ratios
+inertia_dist <- inertia_data |>
+  summarise(
+    pct_100_percent_inertia = mean(inertia_ratio == 1.0) * 100,
+    pct_over_80_percent     = mean(inertia_ratio >= 0.8) * 100,
+    avg_inertia_ratio       = mean(inertia_ratio)
+  )
+
+print("=== Habitual Inertia Distribution ===")
+print(inertia_dist)
+
+```
+
+### Interpretation of Results for Hypothesis 7
+
+The relational event analysis provides clear statistical support for **Hypothesis 7**:
+
+1. **Strong Inverse Relationship with Expansion:** Spearman's rank correlation confirms a strong, statistically significant negative relationship between habitual inertia and network expansion ($\rho = -0.5364, p < 0.001$). Repeating payments with the same initial contact directly inhibits a user's progression into multi-user network participation.
+
+2. **Prevalence of Exclusive Dyads:** Among slow starters who made multiple platform transactions, **9.61%** remained exclusively locked into a single pair ($100\%$ habitual inertia). Furthermore, repeat slow starters exhibit an average inertia ratio of **0.547**, meaning more than half of their total activity remains concentrated within their top single contact.
+
+3. **Utility Frequency vs. Social Breadth:** Users locked into exclusive pairs maintained a similar transaction volume (mean = $2.05$) compared to those who expanded (mean = $2.25$). This demonstrates that platform usage frequency can decouple from network breadth—users can become frequent utility transactors while remaining completely isolated from the broader social network.
+
+**Conclusion:** High habitual inertia creates a strong "behavioral lock-in." When slow starters use Venmo primarily to settle recurring payments with a single partner (e.g., a roommate or partner), the routine reinforces 1-to-1 utility habits rather than encouraging broader social discovery.
+
+
+---
+
+# Phase 3: Local Network Friction vs. Expansion
+*Measures how User A's immediate local environment either traps them or bridges them out into wider participation.*
+
+5. **Priority 5: Bridging via Weak Ties**
+   * **Hypothesis 4:** User A expands from 1-to-1 payments to transacting with multiple users if User A forms a weak tie outside User A's immediate local cluster.
+   * **Network Property:** Strength of Weak Ties & Edge Betweenness
+   * **Rationale:** Identifies the exact topological mechanism for stepping out of an initial isolated pair into the broader graph.
+
+   
+```{r hypothesis-4-weak-ties-bridging}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+
+# 1. Load slow starters dataset
+slow_starters <- readRDS("slow_starters.rds")
+
+# 2. Extract transaction relationships for expanded slow starters (unique_partners > 1)
+# Compare the tie strength (transaction volume) of the PRIMARY gateway contact vs SECONDARY expansion contacts
+tie_strength_df <- dbGetQuery(con, sprintf("
+  WITH user_pair_counts AS (
+    SELECT 
+      \"payment.actor.username\"       AS actor,
+      \"payment.target.user.username\" AS target,
+      COUNT(*)                         AS tie_weight
+    FROM read_csv_auto('%s', sample_size=-1, all_varchar=true)
+    WHERE \"payment.target.type\" = 'user'
+      AND \"payment.actor.username\" IS NOT NULL AND \"payment.actor.username\" <> ''
+    GROUP BY actor, target
+  ),
+  ranked_ties AS (
+    SELECT 
+      actor,
+      target,
+      tie_weight,
+      ROW_NUMBER() OVER (PARTITION BY actor ORDER BY tie_weight DESC) AS tie_rank
+    FROM user_pair_counts
+  )
+  SELECT 
+    actor,
+    MAX(CASE WHEN tie_rank = 1 THEN tie_weight END) AS primary_tie_weight,  -- Strongest contact
+    AVG(CASE WHEN tie_rank > 1 THEN tie_weight END) AS expansion_tie_weight, -- New expansion contacts
+    COUNT(*) AS total_partners
+  FROM ranked_ties
+  GROUP BY actor
+  HAVING COUNT(*) > 1
+", csv)) |>
+  filter(actor %in% slow_starters$usr) |>
+  mutate(
+    # Classify whether expansion ties are Weak Ties (fewer txns than primary contact)
+    is_weak_tie_expansion = ifelse(expansion_tie_weight < primary_tie_weight, "Weak Tie Expansion (Low Weight)", "Strong Tie Expansion (High Weight)"),
+    weight_ratio = expansion_tie_weight / primary_tie_weight
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+tie_summary <- tie_strength_df |>
+  group_by(is_weak_tie_expansion) |>
+  summarise(
+    user_count             = n(),
+    pct_of_expanded_users  = (n() / nrow(tie_strength_df)) * 100,
+    avg_primary_weight     = mean(primary_tie_weight),
+    avg_expansion_weight   = mean(expansion_tie_weight),
+    avg_total_partners     = mean(total_partners)
+  )
+
+print("=== Bridging via Weak Ties Summary ===")
+print(tie_summary)
+
+# 3. Paired Wilcoxon Signed-Rank Test: Primary Tie Weight vs Expansion Tie Weight
+wilcox_test_h4 <- wilcox.test(
+  tie_strength_df$primary_tie_weight, 
+  tie_strength_df$expansion_tie_weight, 
+  paired = TRUE
+)
+
+print("=== Paired Wilcoxon Test: Primary Tie Weight vs Expansion Tie Weight ===")
+print(wilcox_test_h4)
+
+# 4. Overall Proportion Test (Is Weak Tie Expansion significantly > 50%?)
+prop_test_h4 <- prop.test(
+  sum(tie_strength_df$expansion_tie_weight < tie_strength_df$primary_tie_weight),
+  nrow(tie_strength_df),
+  p = 0.5,
+  alternative = "greater"
+)
+
+print("=== Binomial Proportion Test for Weak Tie Dominance ===")
+print(prop_test_h4)
+
+# 5. Visualization: Primary vs Expansion Tie Strength Comparison
+ggplot(tie_strength_df, aes(x = is_weak_tie_expansion, fill = is_weak_tie_expansion)) +
+  geom_bar(alpha = 0.85, width = 0.5) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, fontface = "bold") +
+  theme_minimal() +
+  labs(
+    title = "Hypothesis 4: Weak Ties vs. Strong Ties in Network Expansion",
+    subtitle = "Classifying whether slow starters expand via low-frequency weak ties vs high-frequency strong ties",
+    x = "Expansion Tie Classification",
+    y = "Number of Slow Starters",
+    fill = "Tie Classification"
+  ) +
+  scale_fill_manual(values = c("Weak Tie Expansion (Low Weight)" = "#009E73", "Strong Tie Expansion (High Weight)" = "#D55E00"))
+
+```
+
+### Interpretation of Results for Hypothesis 4
+
+The empirical network analysis **rejects Hypothesis 4**, yielding a major structural insight into how slow starters expand:
+
+1. **Dominance of Flat, Equal-Weight Ties:** An overwhelming **85.3%** of expanded slow starters form secondary ties with transaction weights equal to or greater than their primary tie ($1.0$ transaction per partner across all contacts). Only **14.7%** followed the classic Granovetterian weak-tie pattern (expanding via lower-frequency secondary ties attached to a heavy primary contact).
+
+2. **Rejection of Granovetterian Bridging:** The 1-sample proportion test confirms that weak-tie expansion does not dominate network growth in this cohort ($p = 1.0$ against $H_0: p > 0.5$). Rather than building a dense "strong tie" core before reaching across structural holes via weak ties, slow starters expand horizontally through single-use, equal-weight transactions.
+
+3. **Subgroup Nuance:** Among the $14.7\%$ minority who developed a heavy primary contact (mean = $2.23$ transactions), secondary ties were indeed significantly weaker (mean = $1.04$ transactions; paired Wilcoxon $V = 1,109,305, p < 0.001$). 
+
+**Conclusion:** Onboarding expansion for slow starters does not mirror classic social network bridging (where strong ties anchor the user and weak ties provide novel information). Instead, slow starters engage in "horizontal exploration"—making single, unrepeated transactions across multiple distinct counterparties without establishing a heavy primary anchor first.
+
+
+
+
+6. **Priority 6: Trapping by Local Network Constraint**
+   * **Hypothesis 3:** User A delays making multi-user or social transactions if User A is embedded in a highly constrained local cluster where all of User A's contacts are already connected to each other.
+   * **Network Property:** Burt's Constraint ($C_i$) & Local Clustering Coefficient ($CC_i$)
+   * **Rationale:** Measures structural friction—dense, closed friend groups can suppress public/social expansion.
+
+
+```{r hypothesis-3-local-network-constraint}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+
+# 1. Load datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Filter active slow starters with degree k >= 2 (required for clustering/constraint)
+user_degrees <- user_to_user |>
+  filter(userA %in% slow_starters$usr) |>
+  group_by(userA) |>
+  summarise(
+    total_partners = n_distinct(userB),
+    total_txns     = sum(transaction_number)
+  ) |>
+  rename(usr = userA) |>
+  filter(total_partners >= 2)
+
+# 3. Construct igraph graph object
+g_edges <- user_to_user |>
+  select(userA, userB) |>
+  distinct()
+
+g <- graph_from_data_frame(g_edges, directed = FALSE)
+
+# Match target users present in both data and graph
+target_users <- intersect(user_degrees$usr, V(g)$name)
+
+# 4. Compute Local Clustering Coefficient (CC_i) and Burt's Constraint (C_i)
+cc_scores <- transitivity(g, type = "local", vids = target_users, isolates = "zero")
+c_scores  <- constraint(g, nodes = target_users)
+
+constraint_df <- data.frame(
+  usr = target_users,
+  clustering_coef = ifelse(is.na(cc_scores), 0, cc_scores),
+  burt_constraint = ifelse(is.na(c_scores), 1, c_scores)
+)
+
+# 5. Merge metrics back into slow_starters cohort
+h3_data <- slow_starters |>
+  inner_join(user_degrees, by = "usr") |>
+  inner_join(constraint_df, by = "usr") |>
+  mutate(
+    cluster_type = ifelse(clustering_coef > 0, "Closed Cluster (CC > 0)", "Open Network (CC = 0)"),
+    constraint_level = ifelse(burt_constraint >= median(burt_constraint, na.rm = TRUE), "High Constraint", "Low Constraint")
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+constraint_summary <- h3_data |>
+  group_by(cluster_type) |>
+  summarise(
+    user_count           = n(),
+    avg_clustering       = mean(clustering_coef),
+    avg_burt_constraint  = mean(burt_constraint),
+    avg_days_to_first    = mean(days_to_first, na.rm = TRUE),
+    median_days_to_first = median(days_to_first, na.rm = TRUE),
+    avg_total_partners   = mean(total_partners),
+    avg_total_txns       = mean(total_txns)
+  )
+
+print("=== Local Network Constraint Summary ===")
+print(constraint_summary)
+
+# 6. Statistical Hypothesis Tests
+wilcox_test_h3 <- wilcox.test(days_to_first ~ cluster_type, data = h3_data)
+print("=== Wilcoxon Test: Onboarding Delay vs Cluster Density ===")
+print(wilcox_test_h3)
+
+cor_constraint_delay <- cor.test(h3_data$burt_constraint, h3_data$days_to_first, method = "spearman")
+print("=== Spearman Correlation: Burt Constraint vs Days to First ===")
+print(cor_constraint_delay)
+
+cor_constraint_partners <- cor.test(h3_data$burt_constraint, h3_data$total_partners, method = "spearman")
+print("=== Spearman Correlation: Burt Constraint vs Total Unique Partners ===")
+print(cor_constraint_partners)
+
+
+
+   
+   # 7. Visualization: Days to First Txn by Structural Density
+ggplot(h3_data, aes(x = cluster_type, y = days_to_first, fill = cluster_type)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = 21, outlier.alpha = 0.3) +
+  theme_minimal() +
+  labs(
+    title = "Hypothesis 3: Impact of Local Network Constraint on Onboarding Delay",
+    subtitle = "Comparing activation delay for users in Closed Clusters (CC > 0) vs Open Networks (CC = 0)",
+    x = "Local Structural Density",
+    y = "Days to First Transaction",
+    fill = "Cluster Type"
+  ) +
+  scale_fill_manual(values = c("Closed Cluster (CC > 0)" = "#D95F02", "Open Network (CC = 0)" = "#2B5C8F"))
+   
+
+```
+### Interpretation of Results for Hypothesis 3
+
+The local ego-network analysis reveals a nuanced structural trade-off regarding **Hypothesis 3**:
+
+1. **Strong Suppression of Network Expansion:** Consistent with Burt's structural hole theory, high local constraint ($C_i$) strongly restricts network expansion ($\rho = -0.5564, p < 0.001$). Users embedded in closed, redundant clusters ($CC_i = 0.481, C_i = 0.597$) remain trapped within their immediate social circle rather than spanning structural holes to new groups.
+
+2. **Dual-Phase Effect on Onboarding:** Contrary to the expectation that clustering solely causes friction, users in **Closed Clusters ($CC_i > 0$)** exhibited a slightly faster median onboarding delay of **43 days** compared to **45 days** for users in **Open Networks ($CC_i = 0$)** ($Wilcoxon\ W = 2,778,560, p < 0.001$). Intragroup density provides immediate trust that slightly lowers the barrier to the first transaction, but subsequently caps network expansion.
+
+3. **Overall Constraint Impact:** Across the broader cohort, overall structural constraint maintains a statistically significant positive correlation with activation delay ($\rho = 0.0553, p < 0.001$).
+
+**Conclusion:** Local network constraint exerts a dual-phase effect: while closed local triads accelerate initial trust and first-payment adoption, high structural constraint traps users inside redundant cliques, severely suppressing long-term network growth and multi-group engagement.
+
+
+
+
+
+
+
+7. **Priority 7: Triadic Closure Validation**
+   * **Hypothesis 6:** User A increases transaction activity and social engagement if two of User A's distinct counterparts begin transacting with each other to close an open triad.
+   * **Network Property:** Triadic Closure & Outgoing Shared Partner (OSP)
+   * **Rationale:** Closure creates mutual trust and social proof, lowering the barrier for User A to become active.
+   
+   
+```{r hypothesis-6-triadic-closure}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+
+# 1. Load datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Filter active slow starters with degree k >= 2 (required for triadic closure)
+multi_partner_users <- user_to_user |>
+  filter(userA %in% slow_starters$usr) |>
+  group_by(userA) |>
+  summarise(
+    total_partners = n_distinct(userB),
+    total_txns     = sum(transaction_number)
+  ) |>
+  rename(usr = userA) |>
+  filter(total_partners >= 2)
+
+# 3. Construct local ego-network subgraphs in igraph to calculate local triangles (closed triads)
+g_edges <- user_to_user |>
+  select(userA, userB) |>
+  distinct()
+
+g <- graph_from_data_frame(g_edges, directed = FALSE)
+
+# Match target users present in graph
+target_users <- intersect(multi_partner_users$usr, V(g)$name)
+
+# Count the exact number of closed triangles each target user participates in
+triangle_counts <- count_triangles(g, vids = target_users)
+
+triad_df <- data.frame(
+  usr = target_users,
+  closed_triangles = triangle_counts
+)
+
+# 4. Merge triadic closure metrics back into slow_starters cohort
+h6_data <- slow_starters |>
+  inner_join(multi_partner_users, by = "usr") |>
+  inner_join(triad_df, by = "usr") |>
+  mutate(
+    # Classify whether user participated in at least 1 closed triad
+    triad_status = ifelse(closed_triangles > 0, "Closed Triad (A-B-C Connected)", "Open Triad (Contacts Disconnected)"),
+    is_expanded_further = ifelse(total_partners > 2, 1, 0)
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+triad_summary <- h6_data |>
+  group_by(triad_status) |>
+  summarise(
+    user_count             = n(),
+    pct_of_multi_users     = (n() / nrow(h6_data)) * 100,
+    avg_triangles          = mean(closed_triangles),
+    avg_total_txns         = mean(total_txns),
+    median_total_txns      = median(total_txns),
+    avg_unique_partners    = mean(total_partners),
+    further_expansion_pct  = mean(is_expanded_further) * 100
+  )
+
+print("=== Triadic Closure Validation Summary ===")
+print(triad_summary)
+
+# 5. Statistical Hypothesis Tests
+# Wilcoxon Test for Total Transactions: Closed vs Open Triads
+wilcox_test_h6 <- wilcox.test(total_txns ~ triad_status, data = h6_data)
+print("=== Wilcoxon Test: Total Transactions vs Triadic Closure ===")
+print(wilcox_test_h6)
+
+# Chi-Squared Test for Further Expansion Probability
+chisq_test_h6 <- chisq.test(table(h6_data$triad_status, h6_data$is_expanded_further))
+print("=== Chi-Square Test: Triadic Closure vs Further Expansion ===")
+print(chisq_test_h6)
+
+# Spearman Correlation: Number of Closed Triangles vs Total Activity
+cor_triangles_txns <- cor.test(h6_data$closed_triangles, h6_data$total_txns, method = "spearman")
+print("=== Spearman Correlation: Closed Triangles vs Total Transactions ===")
+print(cor_triangles_txns)
+# 6. Visualization: Transaction Activity by Triadic Closure Status
+ggplot(h6_data, aes(x = triad_status, y = total_txns, fill = triad_status)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21, outlier.alpha = 0.3) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Hypothesis 6: Impact of Triadic Closure on User Transaction Activity",
+    subtitle = "Comparing total transaction counts for slow starters in Closed vs Open Triads",
+    x = "Local Network Triad Structure",
+    y = "Total Transactions (Log10 Scale)",
+    fill = "Triad Status"
+  ) +
+  scale_fill_manual(values = c("Closed Triad (A-B-C Connected)" = "#2B5C8F", "Open Triad (Contacts Disconnected)" = "#D95F02"))
+
+```
+### Interpretation of Results for Hypothesis 6
+
+The local network topology analysis provides strong statistical support for **Hypothesis 6**:
+
+1. **Boost in Transaction Volume:** Slow starters whose contacts formed a **Closed Triad ($A-B-C$ Connected)** completed an average of **3.11 transactions** (median = 3), compared to **2.39 transactions** (median = 2) for users whose contacts remained disconnected in an **Open Triad**. Triadic closure yields a **30.1% increase** in total transaction activity.
+
+2. **Impact of Structural Triangle Density:** Spearman's rank correlation confirms a statistically significant positive relationship between the count of closed triangles and overall user transactions ($\rho = 0.1691, p < 0.001$). Participating in interconnected local triangles reinforces platform usage.
+
+3. **Scarcity of Early Triadic Closure:** Only **6.37%** of multi-partner slow starters participate in a closed triad, with **93.6%** remaining in open V-shaped configurations. While relatively rare during onboarding, triadic closure serves as a potent trigger for long-term engagement when it occurs.
+
+4. **Statistical Significance:** The Wilcoxon rank-sum test ($W = 3,994,814, p < 0.001$) and Pearson's chi-squared test ($\chi^2 = 278.1, p < 0.001$) confirm that both transaction volume and further network expansion are significantly higher for users in closed triads.
+
+**Conclusion:** Triadic closure provides vital social proof and mutual trust. When a user observes two independent peers transacting directly with one another, it validates the network's safety and utility, motivating the user to increase their transaction activity and expand further into the platform.
+
+
+---
+
+# Phase 5: Macro Network Effects & Long-Term Retention
+*Higher-order structural metrics that dictate whether a user stays active long-term or drifts away.*
+
+11. **Priority 11: High-Volume Hub Hazard Trigger**
+    * **Hypothesis 13:** User A has a significantly higher hazard rate of making a public/social transaction if User A receives a transaction from a counterpart who has a high volume of total inbound transactions.
+    * **Network Property:** Normalized Total Degree Received / Continuous-Time Hazard Rates
+    
+```{r hypothesis-13-inbound-hub-indicator}
+library(dplyr)
+library(ggplot2)
+
+# 1. Load datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Calculate Inbound Volume for all counterparties (User B)
+# Inbound Volume = Total payments directed TO User B from across the entire network
+inbound_volume <- user_to_user |>
+  group_by(userB) |>
+  summarise(
+    inbound_txns_received = sum(transaction_number),
+    unique_senders = n_distinct(userA)
+  ) |>
+  rename(gateway_partner = userB)
+
+# 3. Link slow starters to their primary contact and create the BYI (Big Inbound) indicator
+h13_data <- slow_starters |>
+  inner_join(
+    user_to_user |>
+      filter(userA %in% slow_starters$usr) |>
+      group_by(userA) |>
+      summarise(
+        primary_partner = userB[which.max(transaction_number)][1],
+        total_txns = sum(transaction_number),
+        unique_partners = n_distinct(userB)
+      ) |>
+      rename(usr = userA),
+    by = "usr"
+  ) |>
+  left_join(inbound_volume, by = c("primary_partner" = "gateway_partner")) |>
+  mutate(
+    inbound_txns_received = ifelse(is.na(inbound_txns_received), 1, inbound_txns_received),
+    # BYI Indicator: 1 if partner is in the Top Quartile (High Inbound Volume Hub), 0 otherwise
+    is_byi_hub = ifelse(inbound_txns_received >= quantile(inbound_txns_received, 0.75, na.rm = TRUE), "High Inbound Hub (BYI = 1)", "Standard Partner (BYI = 0)"),
+    # Event: Did the user activate beyond 1 transaction?
+    is_active = ifelse(total_txns > 1, 1, 0)
+  )
+
+# --- HAZARD RATE & INCIDENCE RATE RATIO (IRR) ANALYSIS ---
+
+# 4. Summary Table: Empirical Event Rates (Hazard Rates)
+h13_summary <- h13_data |>
+  group_by(is_byi_hub) |>
+  summarise(
+    user_count             = n(),
+    avg_inbound_volume     = mean(inbound_txns_received),
+    activated_users        = sum(is_active),
+    activation_rate_pct    = mean(is_active) * 100,
+    total_person_days      = sum(days_to_first),
+    # Hazard Rate = Activations per 1,000 Person-Days
+    hazard_rate_per_1k_days = (sum(is_active) / sum(days_to_first)) * 1000,
+    avg_total_txns         = mean(total_txns)
+  )
+
+print("=== High Inbound Hub (BYI) Hazard Analysis Summary ===")
+print(h13_summary)
+
+# 5. Compute Rate Ratio (Incidence Rate Ratio / Simple Hazard Ratio)
+hazard_byi   <- h13_summary$hazard_rate_per_1k_days[h13_summary$is_byi_hub == "High Inbound Hub (BYI = 1)"]
+hazard_std   <- h13_summary$hazard_rate_per_1k_days[h13_summary$is_byi_hub == "Standard Partner (BYI = 0)"]
+rate_ratio   <- hazard_byi / hazard_std
+
+print(paste("Incidence Rate Ratio (BYI Hazard Ratio):", round(rate_ratio, 3)))
+
+# 6. Chi-Square Test for Activation Proportion Difference
+chisq_test_h13 <- chisq.test(table(h13_data$is_byi_hub, h13_data$is_active))
+print("=== Chi-Square Test: BYI Hub Status vs Activation ===")
+print(chisq_test_h13)
+
+
+# 7. Visualization: Hazard Rates by BYI Hub Status
+ggplot(h13_summary, aes(x = is_byi_hub, y = hazard_rate_per_1k_days, fill = is_byi_hub)) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  geom_text(aes(label = paste0(round(hazard_rate_per_1k_days, 2), " / 1k days")), vjust = -0.5, fontface = "bold") +
+  theme_minimal() +
+  labs(
+    title = "Hypothesis 13: Activation Hazard Rate by Counterpart Inbound Volume (BYI)",
+    subtitle = "Comparing event activation hazard rates (activations per 1,000 person-days)",
+    x = "Counterpart Hub Classification",
+    y = "Hazard Rate (Activations / 1,000 Person-Days)",
+    fill = "BYI Status"
+  ) +
+  scale_fill_manual(values = c("High Inbound Hub (BYI = 1)" = "#009E73", "Standard Partner (BYI = 0)" = "#D55E00")) +
+  ylim(0, max(h13_summary$hazard_rate_per_1k_days) * 1.2)
+```
+
+
+
+13. **Priority 13: Structural Brokerage & Retention**
+    * **Hypothesis 8:** User A remains active long-term if User A occupies a structural brokerage role connecting two previously disconnected groups, rather than staying inside a single dense clique.
+    * **Network Property:** Fernandez & Gould Brokerage Roles & Betweenness Centrality
+    * **Rationale:** Requires a fully formed transaction graph over an extended observation window to evaluate accurately.
+
+```{r hypothesis-8-brokerage-and-retention}
+library(DBI)
+library(duckdb)
+library(dplyr)
+library(ggplot2)
+library(igraph)
+
+# 1. Load datasets
+slow_starters <- readRDS("slow_starters.rds")
+user_to_user  <- readRDS("user_to_user.rds")
+
+# 2. Construct global undirected graph
+g_edges <- user_to_user |>
+  select(userA, userB) |>
+  distinct()
+
+g <- graph_from_data_frame(g_edges, directed = FALSE)
+
+# Match target slow starters
+target_users <- intersect(slow_starters$usr, V(g)$name)
+
+# 3. Compute Betweenness Centrality (Normalized) to quantify Structural Brokerage
+# High betweenness indicates the user lies on the shortest paths between distinct network components
+betweenness_scores <- betweenness(g, v = target_users, directed = FALSE, normalized = TRUE)
+
+brokerage_df <- data.frame(
+  usr = target_users,
+  betweenness = betweenness_scores
+)
+
+# 4. Merge back with slow starters & long-term outcome indicators
+h8_data <- slow_starters |>
+  inner_join(brokerage_df, by = "usr") |>
+  left_join(
+    user_to_user |>
+      group_by(userA) |>
+      summarise(
+        total_txns = sum(transaction_number),
+        unique_partners = n_distinct(userB)
+      ) |>
+      rename(usr = userA),
+    by = "usr"
+  ) |>
+  mutate(
+    # Classify Role: Structural Broker (Top Quartile Betweenness) vs Clique Member
+    brokerage_role = ifelse(
+      betweenness > quantile(betweenness, 0.75, na.rm = TRUE),
+      "Structural Broker (High Betweenness)",
+      "Clique / Peripheral Node (Low Betweenness)"
+    ),
+    is_retained = ifelse(total_txns > 1, 1, 0)
+  )
+
+# --- STATISTICAL ANALYSIS & SUMMARY ---
+
+h8_summary <- h8_data |>
+  group_by(brokerage_role) |>
+  summarise(
+    user_count            = n(),
+    avg_betweenness       = mean(betweenness),
+    retention_rate_pct    = mean(is_retained) * 100,
+    avg_total_txns        = mean(total_txns, na.rm = TRUE),
+    median_total_txns     = median(total_txns, na.rm = TRUE),
+    avg_unique_partners   = mean(unique_partners, na.rm = TRUE)
+  )
+
+print("=== Structural Brokerage & Retention Summary ===")
+print(h8_summary)
+
+# 5. Statistical Hypothesis Tests
+wilcox_test_h8 <- wilcox.test(total_txns ~ brokerage_role, data = h8_data)
+print("=== Wilcoxon Test: Total Transactions vs Brokerage Role ===")
+print(wilcox_test_h8)
+
+cor_betweenness_retention <- cor.test(h8_data$betweenness, h8_data$total_txns, method = "spearman")
+print("=== Spearman Correlation: Betweenness Centrality vs Total Transactions ===")
+print(cor_betweenness_retention)
+
+# 6. Visualization: Total Transactions by Brokerage Role
+ggplot(h8_data, aes(x = brokerage_role, y = total_txns, fill = brokerage_role)) +
+  geom_boxplot(alpha = 0.8, outlier.shape = 21, outlier.alpha = 0.3) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Hypothesis 8: Impact of Structural Brokerage on Long-Term Activity",
+    subtitle = "Comparing transaction volume for Structural Brokers (High Betweenness) vs Clique Members",
+    x = "Network Structural Role",
+    y = "Total Transactions (Log10 Scale)",
+    fill = "Brokerage Role"
+  ) +
+  scale_fill_manual(values = c(
+    "Structural Broker (High Betweenness)" = "#2B5C8F",
+    "Clique / Peripheral Node (Low Betweenness)" = "#D95F02"
+  ))
+```
+### Interpretation of Results for Hypothesis 8
+
+The structural network position analysis provides strong empirical support for **Hypothesis 8**:
+
+1. **Strong Correlation with Ongoing Engagement:** Spearman's rank correlation reveals a strong, statistically significant positive relationship between a user's betweenness centrality (structural brokerage) and their total transaction activity ($\rho = 0.5722, p < 0.001$). Acting as a structural bridge between distinct network components is a primary driver of sustained platform activity.
+
+2. **Substantial Activity Gain for Brokers:** Users occupying **Structural Brokerage roles** averaged **1.79 total transactions** (median = 2), compared to **1.06 transactions** (median = 1) for peripheral or single-clique nodes. Occupying a brokerage role yields a **68.9% increase** in transaction volume.
+
+3. **Prevalence of Peripheral Isolation:** An overwhelming **84.5%** of slow starters occupy peripheral positions with zero betweenness ($betweenness = 0$). Only **15.5%** establish bridging positions that link otherwise disconnected counterparties.
+
+4. **Statistical Significance:** The Wilcoxon rank-sum test ($W = 349,074,312, p < 0.001$) confirms that transaction activity is significantly higher for structural brokers.
+
+**Conclusion:** Consistent with Fernandez & Gould's structural brokerage framework, spanning structural holes between distinct social groups prevents user drop-off. When slow starters serve as transaction bridges between different circles, their platform utility expands, driving long-term retention and engagement.
